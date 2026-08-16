@@ -1,18 +1,20 @@
-"""Proxy RunPod Serverless jobs to the local llama.cpp OpenAI server."""
+"""Proxy RunPod Serverless jobs to the local Ollama OpenAI server."""
 
 import asyncio
 import logging
 import os
+import threading
 from typing import Any, AsyncGenerator, Optional, Tuple
 
 import aiohttp
 
-LLAMA_PORT = os.getenv("LLAMA_PORT", "8000")
-LLAMA_BASE_URL = f"http://127.0.0.1:{LLAMA_PORT}"
+OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "3600"))
 STARTUP_TIMEOUT = float(os.getenv("STARTUP_TIMEOUT", "1800"))
 
-llama_process = None
+ollama_process = None
+model_ready = threading.Event()
+model_error = threading.Event()
 
 
 def _normalize_job_input(job_input: dict) -> Tuple[str, str, Optional[dict]]:
@@ -37,17 +39,13 @@ def _error(message: str) -> dict:
 
 async def _wait_until_ready() -> bool:
     deadline = asyncio.get_running_loop().time() + STARTUP_TIMEOUT
-    timeout = aiohttp.ClientTimeout(total=10)
     while asyncio.get_running_loop().time() < deadline:
-        if llama_process is not None and llama_process.poll() is not None:
+        if model_ready.is_set():
+            return True
+        if model_error.is_set():
             return False
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(f"{LLAMA_BASE_URL}/health") as response:
-                    if response.status == 200:
-                        return True
-        except aiohttp.ClientError:
-            pass
+        if ollama_process is not None and ollama_process.poll() is not None:
+            return False
         await asyncio.sleep(2)
     return False
 
@@ -60,7 +58,7 @@ async def handler(job: dict) -> AsyncGenerator[Any, None]:
         return
 
     if not await _wait_until_ready():
-        yield _error("llama-server did not become ready")
+        yield _error("Ollama model did not become ready")
         return
 
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
@@ -68,14 +66,14 @@ async def handler(job: dict) -> AsyncGenerator[Any, None]:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.request(
                 method,
-                f"{LLAMA_BASE_URL}{route}",
+                f"{OLLAMA_BASE_URL}{route}",
                 json=body,
                 headers={"Content-Type": "application/json"},
             ) as response:
                 if response.status >= 400:
                     detail = await response.text()
-                    logging.error("llama-server HTTP %s: %s", response.status, detail)
-                    yield _error(f"llama-server returned HTTP {response.status}: {detail}")
+                    logging.error("Ollama HTTP %s: %s", response.status, detail)
+                    yield _error(f"Ollama returned HTTP {response.status}: {detail}")
                     return
 
                 if isinstance(body, dict) and body.get("stream") is True:
@@ -84,5 +82,5 @@ async def handler(job: dict) -> AsyncGenerator[Any, None]:
                 else:
                     yield await response.json(content_type=None)
     except aiohttp.ClientError as exc:
-        logging.exception("Request to llama-server failed")
-        yield _error(f"Request to llama-server failed: {exc}")
+        logging.exception("Request to Ollama failed")
+        yield _error(f"Request to Ollama failed: {exc}")

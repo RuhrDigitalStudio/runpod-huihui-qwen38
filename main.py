@@ -1,67 +1,88 @@
-"""Start llama-server, wait for model readiness, then accept RunPod jobs."""
+"""Start Ollama and accept RunPod jobs while the model initializes."""
 
 import logging
 import os
 import signal
 import subprocess
 import sys
+import threading
+import time
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-HOST = "127.0.0.1"
-PORT = os.getenv("LLAMA_PORT", "8000")
+ollama_process = None
+model_ready = threading.Event()
+model_error = threading.Event()
 
-llama_process = None
 
-
-def build_args() -> list[str]:
+def initialize_model() -> None:
     model = os.environ["MODEL_NAME"]
-    alias = os.getenv("SERVED_MODEL_NAME", "huihui-qwen38-27b-abliterated-q4")
-    return [
-        "/app/llama-server",
-        "--host", HOST,
-        "--port", PORT,
-        "--hf-repo", model,
-        "--alias", alias,
-        "--ctx-size", os.getenv("CONTEXT_SIZE", "65536"),
-        "--parallel", "1",
-        "--n-gpu-layers", "999",
-        "--flash-attn", "on",
-        "--cache-type-k", os.getenv("CACHE_TYPE_K", "q8_0"),
-        "--cache-type-v", os.getenv("CACHE_TYPE_V", "q8_0"),
-        "--batch-size", os.getenv("BATCH_SIZE", "1024"),
-        "--ubatch-size", os.getenv("UBATCH_SIZE", "256"),
-        "--fit", "on",
-        "--fit-ctx", os.getenv("MIN_CONTEXT_SIZE", "32768"),
-        "--jinja",
-        "--reasoning", "auto",
-        "--no-mmproj",
-    ]
+    alias = os.environ["SERVED_MODEL_NAME"]
+    deadline = time.monotonic() + float(os.getenv("STARTUP_TIMEOUT", "1800"))
+
+    while time.monotonic() < deadline:
+        if ollama_process is not None and ollama_process.poll() is not None:
+            model_error.set()
+            return
+        result = subprocess.run(
+            ["ollama", "list"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        if result.returncode == 0:
+            break
+        time.sleep(2)
+    else:
+        logging.error("Ollama did not become ready before the startup timeout")
+        model_error.set()
+        return
+
+    logging.info("Ensuring persistent Ollama model %s", model)
+    pull = subprocess.run(
+        ["ollama", "pull", model], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
+    )
+    if pull.returncode != 0:
+        logging.error("Ollama model pull failed with exit code %s", pull.returncode)
+        model_error.set()
+        return
+
+    copy = subprocess.run(
+        ["ollama", "cp", model, alias],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+    )
+    if copy.returncode != 0:
+        logging.error("Ollama model alias creation failed with exit code %s", copy.returncode)
+        model_error.set()
+        return
+
+    logging.info("Ollama model is ready as %s", alias)
+    model_ready.set()
 
 
 def forward_signal(signum, _frame) -> None:
-    if llama_process is not None and llama_process.poll() is None:
-        llama_process.send_signal(signum)
+    if ollama_process is not None and ollama_process.poll() is None:
+        ollama_process.send_signal(signum)
     sys.exit(128 + signum)
 
 
 def main() -> None:
-    global llama_process
+    global ollama_process
     if not os.getenv("MODEL_NAME"):
         raise RuntimeError("MODEL_NAME is required")
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, forward_signal)
 
-    args = build_args()
-    logging.info("Starting llama-server for %s", os.environ["MODEL_NAME"])
-    llama_process = subprocess.Popen(args)
+    logging.info("Starting Ollama for %s", os.environ["MODEL_NAME"])
+    ollama_process = subprocess.Popen(["ollama", "serve"])
+    threading.Thread(target=initialize_model, name="model-initializer", daemon=True).start()
 
     import handler as proxy_handler
     import runpod
 
-    proxy_handler.llama_process = llama_process
-    logging.info("Starting RunPod handler while llama-server initializes")
+    proxy_handler.ollama_process = ollama_process
+    proxy_handler.model_ready = model_ready
+    proxy_handler.model_error = model_error
+    logging.info("Starting RunPod handler while Ollama initializes")
     runpod.serverless.start(
         {
             "handler": proxy_handler.handler,
