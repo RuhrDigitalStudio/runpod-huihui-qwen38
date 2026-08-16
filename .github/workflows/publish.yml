@@ -25,4 +25,4 @@ jobs:
           push: true
           tags: |
             ghcr.io/ruhrdigitalstudio/runpod-huihui-qwen38:latest
-            ghcr.io/ruhrdigitalstudio/runpod-huihui-qwen38:pod-20260816-5
+            ghcr.io/ruhrdigitalstudio/runpod-huihui-qwen38:pod-20260816-6

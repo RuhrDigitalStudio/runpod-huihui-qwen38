@@ -3,6 +3,7 @@
 import hmac
 import logging
 import os
+from pathlib import Path
 import subprocess
 import threading
 import time
@@ -15,12 +16,74 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 PROXY_PORT = int(os.getenv("POD_PROXY_PORT", "8000"))
-STARTUP_TIMEOUT = float(os.getenv("STARTUP_TIMEOUT", "1800"))
+STARTUP_TIMEOUT = float(os.getenv("STARTUP_TIMEOUT", "7200"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "3600"))
 
 ollama_process: Optional[subprocess.Popen] = None
 model_ready = threading.Event()
 model_error = threading.Event()
+
+
+def command_succeeds(args: list[str]) -> bool:
+    return subprocess.run(
+        args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    ).returncode == 0
+
+
+def ensure_secondary_model() -> bool:
+    url = os.getenv("SECONDARY_MODEL_URL")
+    alias = os.getenv("SECONDARY_MODEL_NAME")
+    if not url or not alias:
+        return True
+    if command_succeeds(["ollama", "show", alias]):
+        logging.info("Secondary model is already cached as %s", alias)
+        return True
+
+    model_dir = Path("/runpod-volume/imports")
+    model_dir.mkdir(parents=True, exist_ok=True)
+    model_path = model_dir / "fable-fusion-711-q4-k-m.gguf"
+    partial_path = model_path.with_suffix(".gguf.part")
+    expected_size = int(os.environ["SECONDARY_MODEL_SIZE"])
+
+    logging.info("Downloading the non-MTP Fable Fusion 711 Q4_K_M model")
+    download = subprocess.run(
+        [
+            "curl",
+            "--fail",
+            "--location",
+            "--retry", "8",
+            "--retry-all-errors",
+            "--continue-at", "-",
+            "--output", str(partial_path),
+            url,
+        ]
+    )
+    if (
+        download.returncode != 0
+        or not partial_path.exists()
+        or partial_path.stat().st_size != expected_size
+    ):
+        logging.error("Secondary model download failed or has an unexpected size")
+        return False
+    partial_path.replace(model_path)
+
+    modelfile = model_dir / "fable-fusion-711.Modelfile"
+    modelfile.write_text(
+        f"FROM {model_path}\nPARAMETER num_ctx 262144\n", encoding="ascii"
+    )
+    create = subprocess.run(
+        ["ollama", "create", alias, "--file", str(modelfile)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+    )
+    if create.returncode != 0:
+        logging.error("Secondary Ollama model creation failed")
+        return False
+
+    model_path.unlink()
+    modelfile.unlink()
+    logging.info("Secondary model is ready as %s", alias)
+    return True
 
 
 def initialize_model() -> None:
@@ -59,6 +122,10 @@ def initialize_model() -> None:
     )
     if copy.returncode != 0:
         logging.error("Ollama model alias creation failed with exit code %s", copy.returncode)
+        model_error.set()
+        return
+
+    if not ensure_secondary_model():
         model_error.set()
         return
 

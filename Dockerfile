@@ -4,7 +4,7 @@ LABEL org.opencontainers.image.source="https://github.com/RuhrDigitalStudio/runp
 LABEL org.opencontainers.image.description="RunPod Ollama worker for Huihui Qwen3.8"
 
 RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-pip \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /tmp/requirements.txt
@@ -23,7 +23,9 @@ ENV OLLAMA_HOST=127.0.0.1:11434 \
     OLLAMA_NUM_PARALLEL=1 \
     MODEL_NAME=huihui_ai/Qwen3.8-abliterated \
     SERVED_MODEL_NAME=huihui-qwen38-27b-abliterated-q4 \
-    STARTUP_TIMEOUT=1800
+    SECONDARY_MODEL_NAME=fable-fusion-711-q4 \
+    SECONDARY_MODEL_SIZE=18047255072 \
+    STARTUP_TIMEOUT=7200
 
 WORKDIR /app/worker
 ENTRYPOINT ["python3", "/app/worker/main.py"]

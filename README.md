@@ -10,4 +10,9 @@ persistent Ollama cache at `/runpod-volume/ollama`.
 `pod_main.py` additionally exposes an authenticated API on port 8000 for a
 manually created Pod. The Pod profile uses the native 262,144-token context
 with a Q4 KV cache and is intended to be created only for an active Codex
-session, then stopped while retaining its Pod volume.
+session, then terminated while retaining its network volume.
+
+The Pod initializer also imports the exact regular (non-MTP) Q4_K_M file from
+`Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF`
+as `fable-fusion-711-q4`. Downloads resume after interruption, validate the
+expected byte size, and remove the raw GGUF after Ollama has persisted it.
