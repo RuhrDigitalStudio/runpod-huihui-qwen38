@@ -1,0 +1,136 @@
+"""Run an authenticated Ollama API for an on-demand RunPod Pod."""
+
+import hmac
+import logging
+import os
+import subprocess
+import threading
+import time
+from typing import Optional
+
+import aiohttp
+from aiohttp import web
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+PROXY_PORT = int(os.getenv("POD_PROXY_PORT", "8000"))
+STARTUP_TIMEOUT = float(os.getenv("STARTUP_TIMEOUT", "1800"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "3600"))
+
+ollama_process: Optional[subprocess.Popen] = None
+model_ready = threading.Event()
+model_error = threading.Event()
+
+
+def initialize_model() -> None:
+    model = os.environ["MODEL_NAME"]
+    alias = os.environ["SERVED_MODEL_NAME"]
+    deadline = time.monotonic() + STARTUP_TIMEOUT
+
+    while time.monotonic() < deadline:
+        if ollama_process is not None and ollama_process.poll() is not None:
+            model_error.set()
+            return
+        result = subprocess.run(
+            ["ollama", "list"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        if result.returncode == 0:
+            break
+        time.sleep(2)
+    else:
+        logging.error("Ollama did not become ready before the startup timeout")
+        model_error.set()
+        return
+
+    logging.info("Ensuring persistent Ollama model %s", model)
+    pull = subprocess.run(
+        ["ollama", "pull", model], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
+    )
+    if pull.returncode != 0:
+        logging.error("Ollama model pull failed with exit code %s", pull.returncode)
+        model_error.set()
+        return
+
+    copy = subprocess.run(
+        ["ollama", "cp", model, alias],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+    )
+    if copy.returncode != 0:
+        logging.error("Ollama model alias creation failed with exit code %s", copy.returncode)
+        model_error.set()
+        return
+
+    logging.info("Ollama model is ready as %s", alias)
+    model_ready.set()
+
+
+@web.middleware
+async def authenticate(request: web.Request, handler):
+    if request.path == "/healthz":
+        return await handler(request)
+    expected = f"Bearer {os.environ['POD_API_SECRET']}"
+    if not hmac.compare_digest(request.headers.get("Authorization", ""), expected):
+        raise web.HTTPUnauthorized()
+    return await handler(request)
+
+
+async def health(_request: web.Request) -> web.Response:
+    if model_error.is_set():
+        return web.json_response({"status": "error"}, status=500)
+    status = "ready" if model_ready.is_set() else "initializing"
+    return web.json_response({"status": status})
+
+
+async def proxy(request: web.Request) -> web.StreamResponse:
+    if not model_ready.is_set():
+        return web.json_response({"error": "model is initializing"}, status=503)
+
+    body = await request.read()
+    headers = {"Content-Type": request.headers.get("Content-Type", "application/json")}
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.request(
+            request.method,
+            f"{OLLAMA_BASE_URL}{request.rel_url}",
+            data=body or None,
+            headers=headers,
+        ) as upstream:
+            response = web.StreamResponse(
+                status=upstream.status,
+                headers={"Content-Type": upstream.headers.get("Content-Type", "application/json")},
+            )
+            await response.prepare(request)
+            async for chunk in upstream.content.iter_any():
+                await response.write(chunk)
+            await response.write_eof()
+            return response
+
+
+def stop_process() -> None:
+    if ollama_process is not None and ollama_process.poll() is None:
+        ollama_process.terminate()
+
+
+def main() -> None:
+    global ollama_process
+    for name in ("MODEL_NAME", "SERVED_MODEL_NAME", "POD_API_SECRET"):
+        if not os.getenv(name):
+            raise RuntimeError(f"{name} is required")
+
+    ollama_process = subprocess.Popen(["ollama", "serve"])
+    threading.Thread(target=initialize_model, name="model-initializer", daemon=True).start()
+
+    app = web.Application(middlewares=[authenticate])
+    app.router.add_get("/healthz", health)
+    app.router.add_route("*", "/{path:.*}", proxy)
+
+    try:
+        web.run_app(app, host="0.0.0.0", port=PROXY_PORT, access_log=None)
+    finally:
+        stop_process()
+
+
+if __name__ == "__main__":
+    main()

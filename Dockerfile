@@ -10,14 +10,14 @@ RUN apt-get update \
 COPY requirements.txt /tmp/requirements.txt
 RUN python3 -m pip install --break-system-packages --no-cache-dir -r /tmp/requirements.txt
 
-COPY handler.py main.py /app/worker/
+COPY handler.py main.py pod_main.py /app/worker/
 
 ENV OLLAMA_HOST=127.0.0.1:11434 \
     HOME=/runpod-volume/ollama-home \
     OLLAMA_MODELS=/runpod-volume/ollama \
-    OLLAMA_CONTEXT_LENGTH=65536 \
+    OLLAMA_CONTEXT_LENGTH=262144 \
     OLLAMA_FLASH_ATTENTION=1 \
-    OLLAMA_KV_CACHE_TYPE=q8_0 \
+    OLLAMA_KV_CACHE_TYPE=q4_0 \
     OLLAMA_KEEP_ALIVE=-1 \
     OLLAMA_MAX_LOADED_MODELS=1 \
     OLLAMA_NUM_PARALLEL=1 \
