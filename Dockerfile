@@ -14,6 +14,7 @@ COPY handler.py main.py /app/worker/
 
 ENV HF_HOME=/runpod-volume/huggingface-cache \
     LLAMA_CACHE=/runpod-volume/huggingface-cache \
+    LD_LIBRARY_PATH=/app \
     MODEL_NAME=huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF:Q4_K \
     SERVED_MODEL_NAME=huihui-qwen38-27b-abliterated-q4 \
     CONTEXT_SIZE=65536 \
