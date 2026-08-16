@@ -1,7 +1,7 @@
 FROM ollama/ollama@sha256:b23b01ffcfbcf197571b0c8b0b0e73e437be02fc2d2786badea8a5734e047188
 
 LABEL org.opencontainers.image.source="https://github.com/RuhrDigitalStudio/runpod-huihui-qwen38"
-LABEL org.opencontainers.image.description="RunPod Serverless Ollama worker for Huihui Qwen3.8"
+LABEL org.opencontainers.image.description="RunPod Ollama worker for Huihui Qwen3.8"
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-pip \
