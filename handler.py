@@ -1,5 +1,6 @@
 """Proxy RunPod Serverless jobs to the local llama.cpp OpenAI server."""
 
+import asyncio
 import logging
 import os
 from typing import Any, AsyncGenerator, Optional, Tuple
@@ -9,6 +10,7 @@ import aiohttp
 LLAMA_PORT = os.getenv("LLAMA_PORT", "8000")
 LLAMA_BASE_URL = f"http://127.0.0.1:{LLAMA_PORT}"
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "3600"))
+STARTUP_TIMEOUT = float(os.getenv("STARTUP_TIMEOUT", "1800"))
 
 llama_process = None
 
@@ -33,6 +35,23 @@ def _error(message: str) -> dict:
     return {"error": {"message": message, "type": "worker_error", "code": None}}
 
 
+async def _wait_until_ready() -> bool:
+    deadline = asyncio.get_running_loop().time() + STARTUP_TIMEOUT
+    timeout = aiohttp.ClientTimeout(total=10)
+    while asyncio.get_running_loop().time() < deadline:
+        if llama_process is not None and llama_process.poll() is not None:
+            return False
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(f"{LLAMA_BASE_URL}/health") as response:
+                    if response.status == 200:
+                        return True
+        except aiohttp.ClientError:
+            pass
+        await asyncio.sleep(2)
+    return False
+
+
 async def handler(job: dict) -> AsyncGenerator[Any, None]:
     try:
         route, method, body = _normalize_job_input(job.get("input") or {})
@@ -40,8 +59,8 @@ async def handler(job: dict) -> AsyncGenerator[Any, None]:
         yield _error(str(exc))
         return
 
-    if llama_process is not None and llama_process.poll() is not None:
-        yield _error("llama-server is not running")
+    if not await _wait_until_ready():
+        yield _error("llama-server did not become ready")
         return
 
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
