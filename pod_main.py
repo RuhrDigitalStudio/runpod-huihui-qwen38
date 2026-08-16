@@ -46,8 +46,25 @@ def ensure_secondary_model() -> bool:
     expected_size = int(os.environ["SECONDARY_MODEL_SIZE"])
 
     logging.info("Downloading the non-MTP Fable Fusion 711 Q4_K_M model")
-    download = subprocess.run(
-        [
+    if command_succeeds(["aria2c", "--version"]):
+        download_args = [
+            "aria2c",
+            "--continue=true",
+            "--max-connection-per-server=16",
+            "--split=16",
+            "--min-split-size=16M",
+            "--file-allocation=none",
+            "--auto-file-renaming=false",
+            "--allow-overwrite=true",
+            "--max-tries=12",
+            "--retry-wait=5",
+            "--summary-interval=30",
+            "--dir", str(partial_path.parent),
+            "--out", partial_path.name,
+            url,
+        ]
+    else:
+        download_args = [
             "curl",
             "--fail",
             "--location",
@@ -57,7 +74,7 @@ def ensure_secondary_model() -> bool:
             "--output", str(partial_path),
             url,
         ]
-    )
+    download = subprocess.run(download_args)
     if (
         download.returncode != 0
         or not partial_path.exists()
