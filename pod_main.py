@@ -1,6 +1,7 @@
 """Run an authenticated Ollama API for an on-demand RunPod Pod."""
 
 import hmac
+import json
 import logging
 import os
 from pathlib import Path
@@ -22,6 +23,48 @@ REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "3600"))
 ollama_process: Optional[subprocess.Popen] = None
 model_ready = threading.Event()
 model_error = threading.Event()
+
+
+def message_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for item in content:
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            parts.append(item["text"])
+    return "\n".join(parts)
+
+
+def normalize_fable_responses_request(body: bytes) -> bytes:
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return body
+    if payload.get("model") != os.getenv("SECONDARY_MODEL_NAME"):
+        return body
+    messages = payload.get("input")
+    if not isinstance(messages, list):
+        return body
+
+    instructions = []
+    existing = message_text(payload.get("instructions"))
+    if existing:
+        instructions.append(existing)
+    remaining = []
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") in {"system", "developer"}:
+            text = message_text(message.get("content"))
+            if text:
+                instructions.append(text)
+        else:
+            remaining.append(message)
+    if len(remaining) == len(messages):
+        return body
+    payload["input"] = remaining
+    payload["instructions"] = "\n\n".join(instructions)
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
 def command_succeeds(args: list[str]) -> bool:
@@ -172,6 +215,8 @@ async def proxy(request: web.Request) -> web.StreamResponse:
         return web.json_response({"error": "model is initializing"}, status=503)
 
     body = await request.read()
+    if request.method == "POST" and request.path == "/v1/responses":
+        body = normalize_fable_responses_request(body)
     headers = {"Content-Type": request.headers.get("Content-Type", "application/json")}
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
     async with aiohttp.ClientSession(timeout=timeout) as session:
