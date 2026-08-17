@@ -11,6 +11,7 @@ import subprocess
 import threading
 import time
 from typing import Optional
+from urllib.request import Request, urlopen
 
 import aiohttp
 from aiohttp import web
@@ -120,6 +121,36 @@ def configure_context_length() -> int:
         )
     os.environ["OLLAMA_CONTEXT_LENGTH"] = str(context_length)
     return context_length
+
+
+def warm_model(alias: str) -> bool:
+    payload = json.dumps(
+        {
+            "model": alias,
+            "prompt": " ",
+            "stream": False,
+            "keep_alive": -1,
+            "options": {"num_predict": 1},
+        }
+    ).encode("utf-8")
+    request = Request(
+        f"{OLLAMA_BASE_URL}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    logging.info("Warming %s before exposing the API as ready", alias)
+    try:
+        with urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+            if response.status != 200:
+                logging.error("Ollama warmup returned HTTP %s", response.status)
+                return False
+            response.read()
+    except (OSError, TimeoutError) as exc:
+        logging.error("Ollama warmup failed: %s", exc)
+        return False
+    logging.info("Ollama warmup completed for %s", alias)
+    return True
 
 
 def ensure_secondary_model() -> bool:
@@ -254,6 +285,10 @@ def initialize_model() -> None:
         return
 
     if not ensure_secondary_model():
+        model_error.set()
+        return
+
+    if not warm_model(alias):
         model_error.set()
         return
 

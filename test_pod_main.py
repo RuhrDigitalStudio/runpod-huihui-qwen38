@@ -1,6 +1,7 @@
 import asyncio
 import os
 import unittest
+from unittest.mock import MagicMock, patch
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -15,6 +16,20 @@ class ContextSelectionTest(unittest.TestCase):
         self.assertEqual(pod_main.context_length_for_vram(40), 131072)
         self.assertEqual(pod_main.context_length_for_vram(48), 262144)
         self.assertEqual(pod_main.context_length_for_vram(96), 262144)
+
+    @patch("pod_main.urlopen")
+    def test_warmup_loads_model_with_persistent_keep_alive(self, urlopen):
+        response = MagicMock()
+        response.status = 200
+        urlopen.return_value.__enter__.return_value = response
+
+        self.assertTrue(pod_main.warm_model("huihui-test"))
+
+        request = urlopen.call_args.args[0]
+        payload = __import__("json").loads(request.data)
+        self.assertEqual(payload["model"], "huihui-test")
+        self.assertEqual(payload["keep_alive"], -1)
+        self.assertEqual(payload["options"]["num_predict"], 1)
 
 
 class StreamingProxyTest(unittest.IsolatedAsyncioTestCase):
