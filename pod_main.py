@@ -1,5 +1,7 @@
 """Run an authenticated Ollama API for an on-demand RunPod Pod."""
 
+import asyncio
+from contextlib import suppress
 import hmac
 import json
 import logging
@@ -19,6 +21,7 @@ OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 PROXY_PORT = int(os.getenv("POD_PROXY_PORT", "8000"))
 STARTUP_TIMEOUT = float(os.getenv("STARTUP_TIMEOUT", "7200"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "3600"))
+STREAM_HEARTBEAT_INTERVAL = float(os.getenv("STREAM_HEARTBEAT_INTERVAL", "15"))
 
 ollama_process: Optional[subprocess.Popen] = None
 model_ready = threading.Event()
@@ -67,10 +70,56 @@ def normalize_fable_responses_request(body: bytes) -> bytes:
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
+def is_streaming_responses_request(request: web.Request, body: bytes) -> bool:
+    if request.method != "POST" or request.path != "/v1/responses":
+        return False
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    return payload.get("stream") is True
+
+
 def command_succeeds(args: list[str]) -> bool:
     return subprocess.run(
         args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     ).returncode == 0
+
+
+def context_length_for_vram(vram_gib: float) -> int:
+    if vram_gib >= 48:
+        return 262144
+    if vram_gib >= 40:
+        return 131072
+    if vram_gib >= 32:
+        return 65536
+    return 32768
+
+
+def configure_context_length() -> int:
+    configured = os.getenv("OLLAMA_CONTEXT_LENGTH", "AUTO").strip().upper()
+    if configured != "AUTO":
+        context_length = int(configured)
+    else:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        total_mib = sum(int(line.strip()) for line in result.stdout.splitlines() if line.strip())
+        context_length = context_length_for_vram(total_mib / 1024)
+        logging.info(
+            "Selected %s-token context for %.1f GiB aggregate VRAM",
+            context_length,
+            total_mib / 1024,
+        )
+    os.environ["OLLAMA_CONTEXT_LENGTH"] = str(context_length)
+    return context_length
 
 
 def ensure_secondary_model() -> bool:
@@ -78,71 +127,90 @@ def ensure_secondary_model() -> bool:
     alias = os.getenv("SECONDARY_MODEL_NAME")
     if not url or not alias:
         return True
-    if command_succeeds(["ollama", "show", alias]):
-        logging.info("Secondary model is already cached as %s", alias)
-        return True
+    base_alias = os.getenv("SECONDARY_BASE_MODEL_NAME", f"{alias}-base")
+    context_length = int(os.environ["OLLAMA_CONTEXT_LENGTH"])
 
-    model_dir = Path("/runpod-volume/imports")
-    model_dir.mkdir(parents=True, exist_ok=True)
-    model_path = model_dir / "fable-fusion-711-q4-k-m.gguf"
-    partial_path = model_path.with_suffix(".gguf.part")
-    expected_size = int(os.environ["SECONDARY_MODEL_SIZE"])
-
-    logging.info("Downloading the non-MTP Fable Fusion 711 Q4_K_M model")
-    if command_succeeds(["aria2c", "--version"]):
-        download_args = [
-            "aria2c",
-            "--continue=true",
-            "--max-connection-per-server=16",
-            "--split=16",
-            "--min-split-size=16M",
-            "--file-allocation=none",
-            "--auto-file-renaming=false",
-            "--allow-overwrite=true",
-            "--max-tries=12",
-            "--retry-wait=5",
-            "--summary-interval=30",
-            "--dir", str(partial_path.parent),
-            "--out", partial_path.name,
-            url,
-        ]
-    else:
-        download_args = [
-            "curl",
-            "--fail",
-            "--location",
-            "--retry", "8",
-            "--retry-all-errors",
-            "--continue-at", "-",
-            "--output", str(partial_path),
-            url,
-        ]
-    download = subprocess.run(download_args)
-    if (
-        download.returncode != 0
-        or not partial_path.exists()
-        or partial_path.stat().st_size != expected_size
+    if not command_succeeds(["ollama", "show", base_alias]) and command_succeeds(
+        ["ollama", "show", alias]
     ):
-        logging.error("Secondary model download failed or has an unexpected size")
-        return False
-    partial_path.replace(model_path)
+        if not command_succeeds(["ollama", "cp", alias, base_alias]):
+            logging.error("Could not migrate the cached secondary model")
+            return False
 
-    modelfile = model_dir / "fable-fusion-711.Modelfile"
-    modelfile.write_text(
-        f"FROM {model_path}\nPARAMETER num_ctx 262144\n", encoding="ascii"
+    if not command_succeeds(["ollama", "show", base_alias]):
+        model_dir = Path("/runpod-volume/imports")
+        model_dir.mkdir(parents=True, exist_ok=True)
+        model_path = model_dir / "fable-fusion-711-q4-k-m.gguf"
+        partial_path = model_path.with_suffix(".gguf.part")
+        expected_size = int(os.environ["SECONDARY_MODEL_SIZE"])
+
+        logging.info("Downloading the non-MTP Fable Fusion 711 Q4_K_M model")
+        if command_succeeds(["aria2c", "--version"]):
+            download_args = [
+                "aria2c",
+                "--continue=true",
+                "--max-connection-per-server=16",
+                "--split=16",
+                "--min-split-size=16M",
+                "--file-allocation=none",
+                "--auto-file-renaming=false",
+                "--allow-overwrite=true",
+                "--max-tries=12",
+                "--retry-wait=5",
+                "--summary-interval=30",
+                "--dir", str(partial_path.parent),
+                "--out", partial_path.name,
+                url,
+            ]
+        else:
+            download_args = [
+                "curl",
+                "--fail",
+                "--location",
+                "--retry", "8",
+                "--retry-all-errors",
+                "--continue-at", "-",
+                "--output", str(partial_path),
+                url,
+            ]
+        download = subprocess.run(download_args)
+        if (
+            download.returncode != 0
+            or not partial_path.exists()
+            or partial_path.stat().st_size != expected_size
+        ):
+            logging.error("Secondary model download failed or has an unexpected size")
+            return False
+        partial_path.replace(model_path)
+
+        base_modelfile = model_dir / "fable-fusion-711-base.Modelfile"
+        base_modelfile.write_text(f"FROM {model_path}\n", encoding="ascii")
+        create = subprocess.run(
+            ["ollama", "create", base_alias, "--file", str(base_modelfile)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+        )
+        if create.returncode != 0:
+            logging.error("Secondary Ollama base model creation failed")
+            return False
+        model_path.unlink()
+        base_modelfile.unlink()
+
+    runtime_modelfile = Path("/tmp/fable-fusion-711-runtime.Modelfile")
+    runtime_modelfile.write_text(
+        f"FROM {base_alias}\nPARAMETER num_ctx {context_length}\n", encoding="ascii"
     )
     create = subprocess.run(
-        ["ollama", "create", alias, "--file", str(modelfile)],
+        ["ollama", "create", alias, "--file", str(runtime_modelfile)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.STDOUT,
     )
+    runtime_modelfile.unlink(missing_ok=True)
     if create.returncode != 0:
-        logging.error("Secondary Ollama model creation failed")
+        logging.error("Secondary Ollama runtime model creation failed")
         return False
 
-    model_path.unlink()
-    modelfile.unlink()
-    logging.info("Secondary model is ready as %s", alias)
+    logging.info("Secondary model is ready as %s with %s context", alias, context_length)
     return True
 
 
@@ -210,6 +278,69 @@ async def health(_request: web.Request) -> web.Response:
     return web.json_response({"status": status})
 
 
+async def proxy_streaming_responses(
+    request: web.Request, body: bytes, headers: dict[str, str]
+) -> web.StreamResponse:
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        upstream_task = asyncio.ensure_future(
+            session.request(
+                request.method,
+                f"{OLLAMA_BASE_URL}{request.rel_url}",
+                data=body,
+                headers=headers,
+            )
+        )
+        upstream = None
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+        await response.prepare(request)
+        await response.write(b": connected\n\n")
+
+        try:
+            while upstream is None:
+                try:
+                    upstream = await asyncio.wait_for(
+                        asyncio.shield(upstream_task),
+                        timeout=STREAM_HEARTBEAT_INTERVAL,
+                    )
+                except asyncio.TimeoutError:
+                    await response.write(b": keep-alive\n\n")
+
+            if upstream.status >= 400:
+                message = (await upstream.read()).decode("utf-8", errors="replace")
+                payload = json.dumps(
+                    {
+                        "error": {
+                            "message": message or f"Upstream returned HTTP {upstream.status}",
+                            "type": "upstream_error",
+                            "code": str(upstream.status),
+                        }
+                    },
+                    separators=(",", ":"),
+                )
+                await response.write(f"event: error\ndata: {payload}\n\n".encode("utf-8"))
+            else:
+                async for chunk in upstream.content.iter_any():
+                    await response.write(chunk)
+
+            await response.write_eof()
+            return response
+        finally:
+            if upstream is not None:
+                upstream.release()
+            if not upstream_task.done():
+                upstream_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await upstream_task
+
+
 async def proxy(request: web.Request) -> web.StreamResponse:
     if not model_ready.is_set():
         return web.json_response({"error": "model is initializing"}, status=503)
@@ -218,6 +349,9 @@ async def proxy(request: web.Request) -> web.StreamResponse:
     if request.method == "POST" and request.path == "/v1/responses":
         body = normalize_fable_responses_request(body)
     headers = {"Content-Type": request.headers.get("Content-Type", "application/json")}
+    if is_streaming_responses_request(request, body):
+        return await proxy_streaming_responses(request, body, headers)
+
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.request(
@@ -248,6 +382,7 @@ def main() -> None:
         if not os.getenv(name):
             raise RuntimeError(f"{name} is required")
 
+    configure_context_length()
     ollama_process = subprocess.Popen(["ollama", "serve"])
     threading.Thread(target=initialize_model, name="model-initializer", daemon=True).start()
 
